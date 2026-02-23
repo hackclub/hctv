@@ -25,13 +25,14 @@ export async function GET(request: NextRequest) {
 
   if (shouldGetOwned && user) {
     channelConditions.push({ ownerId: user.id });
+    channelConditions.push({ managers: { some: { id: user.id } } });
   }
 
   if (allPersonalChannels) {
-    channelConditions.push({ 
-      personalFor: { 
-        isNot: null 
-      } 
+    channelConditions.push({
+      personalFor: {
+        isNot: null,
+      },
     });
   }
 
@@ -40,9 +41,8 @@ export async function GET(request: NextRequest) {
   }
 
   if (channelConditions.length > 0) {
-    where.channel = channelConditions.length === 1 
-      ? channelConditions[0]
-      : { OR: channelConditions };
+    where.channel =
+      channelConditions.length === 1 ? channelConditions[0] : { OR: channelConditions };
   }
 
   const db = await prisma.streamInfo.findMany({
@@ -57,7 +57,7 @@ export async function GET(request: NextRequest) {
               expiresAt: true,
             },
           },
-        }
+        },
       },
     },
   });
@@ -71,7 +71,8 @@ export async function GET(request: NextRequest) {
     delete obj.channel.obsChatGrantToken;
 
     if (obj.channel.restriction) {
-      const isExpired = obj.channel.restriction.expiresAt &&
+      const isExpired =
+        obj.channel.restriction.expiresAt &&
         new Date(obj.channel.restriction.expiresAt) < new Date();
       if (isExpired) {
         // @ts-ignore
