@@ -1,13 +1,6 @@
 import { z } from 'zod';
 
-const disallowedUsernames = [
-  'admin',
-  'administrator',
-  'settings',
-  'create',
-  // i hope this doesn't age well tbh
-  'zrl',
-];
+const disallowedUsernames = ['admin', 'administrator', 'settings', 'create'];
 const username = z
   .string()
   .min(1)
