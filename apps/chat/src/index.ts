@@ -398,7 +398,8 @@ app.get(
 
       const isModerator = Boolean(
         chatUser &&
-        (chatUser.channelRole === 'owner' ||
+        (chatUser.isPlatformAdmin ||
+          chatUser.channelRole === 'owner' ||
           chatUser.channelRole === 'manager' ||
           chatUser.channelRole === 'chatModerator' ||
           chatUser.channelRole === 'botModerator')
@@ -501,6 +502,13 @@ app.get(
             !socketState.targetUsername ||
             !socketState.channelId
           ) {
+            socket.send(
+              JSON.stringify({
+                type: 'moderationError',
+                code: 'FORBIDDEN',
+                message: 'You do not have permission to moderate this chat.',
+              })
+            );
             return;
           }
 
@@ -553,6 +561,13 @@ app.get(
             !socketState.targetUsername ||
             !socketState.channelId
           ) {
+            socket.send(
+              JSON.stringify({
+                type: 'moderationError',
+                code: 'FORBIDDEN',
+                message: 'You do not have permission to moderate this chat.',
+              })
+            );
             return;
           }
 
