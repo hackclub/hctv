@@ -168,7 +168,7 @@ async function resolveModerationTarget(
       personalChannel: { select: { name: true } },
       ownedChannels: { where: { id: channelId }, select: { id: true } },
       managedChannels: { where: { id: channelId }, select: { id: true } },
-      moderatedChannels: { where: { id: channelId }, select: { id: true } },
+      chatModeratedChannels: { where: { id: channelId }, select: { id: true } },
     },
   });
 
@@ -182,7 +182,7 @@ async function resolveModerationTarget(
     targetChannelRole = 'owner';
   } else if (targetUserRecord.managedChannels.length > 0) {
     targetChannelRole = 'manager';
-  } else if (targetUserRecord.moderatedChannels.length > 0) {
+  } else if (targetUserRecord.chatModeratedChannels.length > 0) {
     targetChannelRole = 'chatModerator';
   }
 
