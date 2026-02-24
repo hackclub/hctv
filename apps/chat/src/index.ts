@@ -199,6 +199,14 @@ async function broadcastRestrictionStateToUser(
   });
 }
 
+const RATE_LIMIT_LUA = `
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return current
+`;
+
 async function isRateLimited(
   channelId: string,
   userId: string,
@@ -206,12 +214,7 @@ async function isRateLimited(
   windowSeconds: number
 ): Promise<boolean> {
   const key = `chat:ratelimit:${channelId}:${userId}`;
-  const currentCount = await redis.incr(key);
-
-  if (currentCount === 1) {
-    await redis.expire(key, windowSeconds);
-  }
-
+  const currentCount = (await redis.eval(RATE_LIMIT_LUA, 1, key, String(windowSeconds))) as number;
   return currentCount > count;
 }
 
@@ -649,6 +652,7 @@ app.get(
           broadcastToChannel(targetUsername, socket, msgObj as unknown as Record<string, unknown>);
         }
         if (msg.type === 'emojiMsg') {
+          if (!socketState.chatUser) return;
           const emojis = msg.emojis as string[];
           const emojiMap: Record<string, string> = {};
 
@@ -675,6 +679,7 @@ app.get(
           );
         }
         if (msg.type === 'emojiSearch') {
+          if (!socketState.chatUser) return;
           const rawSearchTerm = (msg.searchTerm as string)?.trim() ?? '';
           if (!rawSearchTerm || rawSearchTerm.length > 50) {
             ws.send(JSON.stringify({ type: 'emojiSearchResponse', results: [] }));

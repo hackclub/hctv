@@ -6,6 +6,18 @@ import type {
   ChatUser,
 } from '../types/chat.js';
 
+const ROLE_RANK: Record<NonNullable<ChatUser['channelRole']> | '__none__', number> = {
+  owner: 100,
+  manager: 50,
+  chatModerator: 10,
+  botModerator: 10,
+  __none__: 0,
+};
+
+function roleRank(role: ChatUser['channelRole']): number {
+  return role ? (ROLE_RANK[role] ?? 0) : ROLE_RANK.__none__;
+}
+
 type ModerationContext = {
   chatUser: ChatUser;
   targetUsername: string;
@@ -67,31 +79,80 @@ export function sendModerationError(
   );
 }
 
-function requireModerationContext(
+async function requireModerationContext(
   socket: ChatSocket,
   socketState: ChatSocket
-): ModerationContext | null {
-  if (
-    !socketState.isModerator ||
-    !socketState.chatUser ||
-    !socketState.targetUsername ||
-    !socketState.channelId
-  ) {
+): Promise<ModerationContext | null> {
+  if (!socketState.chatUser || !socketState.targetUsername || !socketState.channelId) {
     sendModerationError(socket, 'FORBIDDEN', 'You do not have permission to moderate this chat.');
     return null;
   }
 
+  const chatUser = socketState.chatUser;
+  const channelId = socketState.channelId;
+
+  const [channel, moderatorRecord] = await Promise.all([
+    prisma.channel.findUnique({
+      where: { id: channelId },
+      select: {
+        ownerId: true,
+        managers: { select: { id: true } },
+        chatModerators: { select: { id: true } },
+        chatModeratorBots: { select: { id: true } },
+      },
+    }),
+    prisma.user.findUnique({
+      where: { id: chatUser.moderatorUserId },
+      select: { isAdmin: true },
+    }),
+  ]);
+
+  if (!channel) {
+    sendModerationError(socket, 'FORBIDDEN', 'You do not have permission to moderate this chat.');
+    return null;
+  }
+
+  const isPlatformAdmin = Boolean(moderatorRecord?.isAdmin);
+
+  let channelRole: ChatUser['channelRole'] = null;
+  if (chatUser.isBot) {
+    if (channel.chatModeratorBots.some((b) => b.id === chatUser.id)) {
+      channelRole = 'botModerator';
+    }
+  } else if (channel.ownerId === chatUser.id) {
+    channelRole = 'owner';
+  } else if (channel.managers.some((m) => m.id === chatUser.id)) {
+    channelRole = 'manager';
+  } else if (channel.chatModerators.some((m) => m.id === chatUser.id)) {
+    channelRole = 'chatModerator';
+  }
+
+  const isModerator =
+    isPlatformAdmin ||
+    channelRole === 'owner' ||
+    channelRole === 'manager' ||
+    channelRole === 'chatModerator' ||
+    channelRole === 'botModerator';
+
+  if (!isModerator) {
+    sendModerationError(socket, 'FORBIDDEN', 'You do not have permission to moderate this chat.');
+    return null;
+  }
+
+  const resolvedChatUser: ChatUser = { ...chatUser, isPlatformAdmin, channelRole };
+
   return {
-    chatUser: socketState.chatUser,
+    chatUser: resolvedChatUser,
     targetUsername: socketState.targetUsername,
-    channelId: socketState.channelId,
+    channelId,
   };
 }
 
 async function resolveModerationTarget(
   socket: ChatSocket,
   actingModeratorUserId: string,
-  rawTargetUserId: unknown
+  rawTargetUserId: unknown,
+  channelId: string
 ) {
   const targetUserId = typeof rawTargetUserId === 'string' ? rawTargetUserId : '';
 
@@ -105,6 +166,9 @@ async function resolveModerationTarget(
     select: {
       isAdmin: true,
       personalChannel: { select: { name: true } },
+      ownedChannels: { where: { id: channelId }, select: { id: true } },
+      managedChannels: { where: { id: channelId }, select: { id: true } },
+      moderatedChannels: { where: { id: channelId }, select: { id: true } },
     },
   });
 
@@ -113,9 +177,19 @@ async function resolveModerationTarget(
     return null;
   }
 
+  let targetChannelRole: ChatUser['channelRole'] = null;
+  if (targetUserRecord.ownedChannels.length > 0) {
+    targetChannelRole = 'owner';
+  } else if (targetUserRecord.managedChannels.length > 0) {
+    targetChannelRole = 'manager';
+  } else if (targetUserRecord.moderatedChannels.length > 0) {
+    targetChannelRole = 'chatModerator';
+  }
+
   return {
     targetUserId,
     targetUserRecord,
+    targetChannelRole,
     resolvedTargetUsername: targetUserRecord.personalChannel?.name ?? 'that user',
   };
 }
@@ -125,7 +199,7 @@ async function ensureAdminTargetModerationAllowed(
   actingModeratorUserId: string,
   targetIsAdmin: boolean
 ) {
-  if (process.env.NODE_ENV !== 'production' || !targetIsAdmin) {
+  if (!targetIsAdmin) {
     return true;
   }
 
@@ -146,13 +220,33 @@ async function ensureAdminTargetModerationAllowed(
   return true;
 }
 
+function ensureRoleHierarchyAllowed(
+  socket: ChatSocket,
+  actorRole: ChatUser['channelRole'],
+  actorIsPlatformAdmin: boolean,
+  targetRole: ChatUser['channelRole']
+): boolean {
+  if (actorIsPlatformAdmin) return true;
+
+  if (roleRank(actorRole) <= roleRank(targetRole)) {
+    sendModerationError(
+      socket,
+      'FORBIDDEN',
+      'You cannot moderate a user with an equal or higher role than yours.'
+    );
+    return false;
+  }
+
+  return true;
+}
+
 export async function handleDeleteMessageCommand(
   socket: ChatSocket,
   socketState: ChatSocket,
   msg: ChatModerationCommand,
   deps: DeleteMessageDeps
 ) {
-  const context = requireModerationContext(socket, socketState);
+  const context = await requireModerationContext(socket, socketState);
   if (!context) {
     return;
   }
@@ -186,13 +280,18 @@ export async function handleUserRestrictionCommand(
   msg: ChatModerationCommand,
   deps: UserRestrictionDeps
 ) {
-  const context = requireModerationContext(socket, socketState);
+  const context = await requireModerationContext(socket, socketState);
   if (!context) {
     return;
   }
 
   const actingModeratorUserId = context.chatUser.moderatorUserId;
-  const target = await resolveModerationTarget(socket, actingModeratorUserId, msg.targetUserId);
+  const target = await resolveModerationTarget(
+    socket,
+    actingModeratorUserId,
+    msg.targetUserId,
+    context.channelId
+  );
   if (!target) {
     return;
   }
@@ -203,6 +302,16 @@ export async function handleUserRestrictionCommand(
     target.targetUserRecord.isAdmin
   );
   if (!canModerateTarget) {
+    return;
+  }
+
+  const hierarchyAllowed = ensureRoleHierarchyAllowed(
+    socket,
+    context.chatUser.channelRole,
+    context.chatUser.isPlatformAdmin,
+    target.targetChannelRole
+  );
+  if (!hierarchyAllowed) {
     return;
   }
 
