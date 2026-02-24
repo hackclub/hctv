@@ -1,5 +1,5 @@
 import { serve } from '@hono/node-server';
-import { createNodeWebSocket, type ModifiedWebSocket } from '@hctv/hono-ws';
+import { createNodeWebSocket } from '@hctv/hono-ws';
 import { Hono } from 'hono';
 import { readFile } from 'node:fs/promises';
 import { lucia } from '@hctv/auth';
@@ -7,7 +7,19 @@ import { getCookie } from 'hono/cookie';
 import { getPersonalChannel } from './utils/personalChannel.js';
 import { ChatModerationAction, getRedisConnection, prisma } from '@hctv/db';
 import uFuzzy from '@leeoniya/ufuzzy';
+import {
+  handleDeleteMessageCommand,
+  handleUserRestrictionCommand,
+  sendModerationError,
+} from './utils/moderation.js';
 import { randomString } from './utils/randomString.js';
+import type {
+  ChatModerationCommand,
+  ChatModerationSettingsShape,
+  ChatRestrictionState,
+  ChatSocket,
+  ChatUser,
+} from './types/chat.js';
 
 const redis = getRedisConnection();
 const MESSAGE_HISTORY_SIZE = 100;
@@ -15,6 +27,11 @@ const MESSAGE_TTL = 60 * 60 * 24;
 const MODERATION_SETTINGS_CACHE_TTL_SECONDS = 30;
 const threed = await readFile('./src/3d.txt', 'utf-8');
 const uf = new uFuzzy();
+
+type IncomingMessage = {
+  type?: string;
+  [key: string]: unknown;
+};
 
 const DEFAULT_MODERATION_SETTINGS: ChatModerationSettingsShape = {
   blockedTerms: [],
@@ -483,7 +500,7 @@ app.get(
       try {
         const socket = ws as unknown as ChatSocket;
         const socketState = resolveSocketState(socket);
-        const msg = JSON.parse(evt.data.toString());
+        const msg = JSON.parse(evt.data.toString()) as IncomingMessage;
 
         if (msg.type === 'ping') {
           await redis.setex(
@@ -496,56 +513,11 @@ app.get(
         }
 
         if (msg.type === 'mod:deleteMessage') {
-          if (
-            !socketState.isModerator ||
-            !socketState.chatUser ||
-            !socketState.targetUsername ||
-            !socketState.channelId
-          ) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'FORBIDDEN',
-                message: 'You do not have permission to moderate this chat.',
-              })
-            );
-            return;
-          }
-
-          const msgId = typeof msg.msgId === 'string' ? msg.msgId : '';
-          if (!msgId) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'INVALID_REQUEST',
-                message: 'Invalid message id.',
-              })
-            );
-            return;
-          }
-
-          const deleted = await deleteMessageFromHistory(socketState.targetUsername, msgId);
-          if (!deleted) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'NOT_FOUND',
-                message: 'Message not found.',
-              })
-            );
-            return;
-          }
-
-          await logModerationEvent({
-            action: ChatModerationAction.MESSAGE_DELETED,
-            channelId: socketState.channelId,
-            moderatorId: socketState.chatUser.moderatorUserId,
-            reason: 'Message deleted by moderator',
-            details: { msgId },
+          await handleDeleteMessageCommand(socket, socketState, msg as ChatModerationCommand, {
+            deleteMessageFromHistory,
+            logModerationEvent,
+            broadcastToChannel,
           });
-
-          broadcastToChannel(socketState.targetUsername, socket, { type: 'messageDeleted', msgId });
-
           return;
         }
 
@@ -555,166 +527,11 @@ app.get(
           msg.type === 'mod:unbanUser' ||
           msg.type === 'mod:liftTimeout'
         ) {
-          if (
-            !socketState.isModerator ||
-            !socketState.chatUser ||
-            !socketState.targetUsername ||
-            !socketState.channelId
-          ) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'FORBIDDEN',
-                message: 'You do not have permission to moderate this chat.',
-              })
-            );
-            return;
-          }
-
-          const actingModeratorUserId = socketState.chatUser.moderatorUserId;
-
-          const targetUserId = typeof msg.targetUserId === 'string' ? msg.targetUserId : '';
-
-          if (!targetUserId || targetUserId === actingModeratorUserId) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'INVALID_TARGET',
-                message: 'Invalid moderation target.',
-              })
-            );
-            return;
-          }
-
-          const targetUserRecord = await prisma.user.findUnique({
-            where: { id: targetUserId },
-            select: {
-              isAdmin: true,
-              personalChannel: { select: { name: true } },
-            },
+          await handleUserRestrictionCommand(socket, socketState, msg as ChatModerationCommand, {
+            logModerationEvent,
+            broadcastRestrictionStateToUser,
+            broadcastToChannel,
           });
-          if (!targetUserRecord) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'INVALID_TARGET',
-                message: 'Target user no longer exists.',
-              })
-            );
-            return;
-          }
-
-          const actingUserRecord = await prisma.user.findUnique({
-            where: { id: actingModeratorUserId },
-            select: { isAdmin: true },
-          });
-          if (
-            process.env.NODE_ENV === 'production' &&
-            targetUserRecord.isAdmin &&
-            !actingUserRecord?.isAdmin
-          ) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'FORBIDDEN',
-                message: 'Platform admins cannot be moderated via chat commands.',
-              })
-            );
-            return;
-          }
-
-          const resolvedTargetUsername = targetUserRecord.personalChannel?.name ?? 'that user';
-
-          if (msg.type === 'mod:unbanUser' || msg.type === 'mod:liftTimeout') {
-            await prisma.chatUserBan.deleteMany({
-              where: {
-                channelId: socketState.channelId,
-                userId: targetUserId,
-              },
-            });
-
-            await logModerationEvent({
-              action: ChatModerationAction.USER_UNBANNED,
-              channelId: socketState.channelId,
-              moderatorId: actingModeratorUserId,
-              targetUserId,
-              reason: 'User unbanned in chat',
-            });
-
-            await broadcastRestrictionStateToUser(
-              socketState.targetUsername,
-              targetUserId,
-              socketState.channelId,
-              socket
-            );
-
-            broadcastToChannel(socketState.targetUsername, socket, {
-              type: 'systemMsg',
-              message: `${resolvedTargetUsername} can chat again.`,
-            });
-            return;
-          }
-
-          const reason =
-            typeof msg.reason === 'string' && msg.reason.trim().length > 0
-              ? msg.reason.trim().slice(0, 250)
-              : msg.type === 'mod:timeoutUser'
-                ? 'Timed out by moderator'
-                : 'Banned by moderator';
-          const durationSeconds =
-            msg.type === 'mod:timeoutUser'
-              ? Math.min(Math.max(Number(msg.durationSeconds) || 300, 10), 60 * 60 * 24)
-              : null;
-          const expiresAt = durationSeconds ? new Date(Date.now() + durationSeconds * 1000) : null;
-
-          await prisma.chatUserBan.upsert({
-            where: {
-              channelId_userId: {
-                channelId: socketState.channelId,
-                userId: targetUserId,
-              },
-            },
-            create: {
-              channelId: socketState.channelId,
-              userId: targetUserId,
-              bannedById: actingModeratorUserId,
-              reason,
-              expiresAt,
-            },
-            update: {
-              bannedById: actingModeratorUserId,
-              reason,
-              expiresAt,
-            },
-          });
-
-          await logModerationEvent({
-            action:
-              msg.type === 'mod:timeoutUser'
-                ? ChatModerationAction.USER_TIMEOUT
-                : ChatModerationAction.USER_BANNED,
-            channelId: socketState.channelId,
-            moderatorId: actingModeratorUserId,
-            targetUserId,
-            reason,
-            details: durationSeconds ? { durationSeconds } : undefined,
-          });
-
-          await broadcastRestrictionStateToUser(
-            socketState.targetUsername,
-            targetUserId,
-            socketState.channelId,
-            socket
-          );
-
-          broadcastToChannel(socketState.targetUsername, socket, {
-            type: 'systemMsg',
-            message:
-              msg.type === 'mod:timeoutUser'
-                ? `${resolvedTargetUsername} was timed out for ${durationSeconds}s.`
-                : `${resolvedTargetUsername} was banned.`,
-          });
-
           return;
         }
 
@@ -741,16 +558,13 @@ app.get(
 
           const restriction = await getActiveRestriction(channelId, chatUser.id);
           if (restriction) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: restriction.type === 'timeout' ? 'TIMED_OUT' : 'BANNED',
-                message:
-                  restriction.type === 'timeout'
-                    ? 'You are currently timed out in this chat.'
-                    : 'You are currently banned from this chat.',
-                restriction,
-              })
+            sendModerationError(
+              socket,
+              restriction.type === 'timeout' ? 'TIMED_OUT' : 'BANNED',
+              restriction.type === 'timeout'
+                ? 'You are currently timed out in this chat.'
+                : 'You are currently banned from this chat.',
+              restriction
             );
 
             await sendChatAccessState(socket, channelId, chatUser.id);
@@ -766,13 +580,7 @@ app.get(
               moderationSettings.rateLimitWindowSeconds
             ))
           ) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'RATE_LIMIT',
-                message: 'You are sending messages too fast.',
-              })
-            );
+            sendModerationError(socket, 'RATE_LIMIT', 'You are sending messages too fast.');
             return;
           }
 
@@ -780,13 +588,7 @@ app.get(
             const slowModeKey = `chat:slowmode:${channelId}:${chatUser.id}`;
             const timeRemaining = await redis.ttl(slowModeKey);
             if (timeRemaining > 0) {
-              socket.send(
-                JSON.stringify({
-                  type: 'moderationError',
-                  code: 'SLOW_MODE',
-                  message: `Slow mode is on. Wait ${timeRemaining}s.`,
-                })
-              );
+              sendModerationError(socket, 'SLOW_MODE', `Slow mode is on. Wait ${timeRemaining}s.`);
               return;
             }
             await redis.setex(slowModeKey, moderationSettings.slowModeSeconds, '1');
@@ -797,12 +599,10 @@ app.get(
             return;
           }
           if (message.length > moderationSettings.maxMessageLength) {
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'MESSAGE_TOO_LONG',
-                message: `Message exceeds ${moderationSettings.maxMessageLength} characters.`,
-              })
+            sendModerationError(
+              socket,
+              'MESSAGE_TOO_LONG',
+              `Message exceeds ${moderationSettings.maxMessageLength} characters.`
             );
             return;
           }
@@ -819,13 +619,7 @@ app.get(
                 details: { blockedTerm },
               });
             }
-            socket.send(
-              JSON.stringify({
-                type: 'moderationError',
-                code: 'BLOCKED_TERM',
-                message: 'Message blocked by channel moderation.',
-              })
-            );
+            sendModerationError(socket, 'BLOCKED_TERM', 'Message blocked by channel moderation.');
             return;
           }
 
@@ -846,7 +640,6 @@ app.get(
           };
 
           const redisStr = JSON.stringify(msgObj);
-          const msgStr = JSON.stringify(msgObj);
 
           const channelKey = `chat:history:${targetUsername}`;
           await redis.zadd(channelKey, Date.now(), redisStr);
@@ -940,53 +733,3 @@ const server = serve(
   }
 );
 injectWebSocket(server);
-
-interface ChatUser {
-  id: string;
-  username: string;
-  pfpUrl: string;
-  displayName?: string;
-  isBot: boolean;
-  moderatorUserId: string;
-  isPlatformAdmin: boolean;
-  channelRole: 'owner' | 'manager' | 'chatModerator' | 'botModerator' | null;
-}
-
-interface ChatModerationSettingsShape {
-  blockedTerms: string[];
-  slowModeSeconds: number;
-  maxMessageLength: number;
-  rateLimitCount: number;
-  rateLimitWindowSeconds: number;
-}
-
-interface ChatRestrictionState {
-  type: 'timeout' | 'ban';
-  reason: string;
-  expiresAt: Date | null;
-}
-
-interface ChatSocket {
-  readyState: number;
-  OPEN: number;
-  send: (data: string) => void;
-  close: () => void;
-  wss: {
-    clients: Set<unknown>;
-  };
-  targetUsername?: string;
-  channelId?: string;
-  chatUser?: ChatUser | null;
-  personalChannel?: any;
-  viewerId?: string;
-  isModerator?: boolean;
-  raw?:
-    | (ModifiedWebSocket & {
-        targetUsername?: string;
-        channelId?: string;
-        chatUser?: ChatUser | null;
-        personalChannel?: any;
-        isModerator?: boolean;
-      })
-    | null;
-}
