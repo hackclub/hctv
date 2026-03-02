@@ -10,7 +10,7 @@ jobs:
     name: Push frontend to Docker Hub
     runs-on: ubuntu-latest
     steps:
-      - name: Wait 
+      - name: Wait
         uses: NathanFirmo/wait-for-other-action@v1.0.4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -40,12 +40,12 @@ jobs:
           RELEASE_URL=$(curl -s https://api.github.com/repos/srizan10/hctv/releases/latest | \
             grep "browser_download_url.*slack-import-emojis-linux-x86_64" | \
             cut -d '"' -f 4)
-          
+
           curl -L -o slack-import-emojis-bin $RELEASE_URL
           chmod +x slack-import-emojis-bin
-          
+
           mkdir -p apps/web/src/lib/instrumentation/
-          
+
           ./slack-import-emojis-bin default
 
           cp emojis.json apps/web/
@@ -98,10 +98,42 @@ jobs:
           secrets: |
             TURBO_TOKEN=${{ secrets.TURBO_TOKEN }}
             TURBO_TEAM=${{ secrets.TURBO_TEAM }}
+  mediamtx:
+    name: Push MediaMTX image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: srizan10/hclive-mediamtx
+          tags: latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/mediamtx/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
   deploy:
     name: Deploy to Coolify
     runs-on: ubuntu-latest
-    needs: [frontend, chat]
+    needs: [frontend, chat, mediamtx]
     steps:
       - name: Send coolify redeploy webhook
         run: |

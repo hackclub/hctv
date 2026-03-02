@@ -58,8 +58,6 @@ services:
     volumes:
       - 'hctv_redis:/data'
   mediamtx:
-    image: 'bluenviron/mediamtx:latest'
+    image: 'srizan10/hclive-mediamtx:latest'
     ports:
       - '8890:8890/udp'
-    volumes:
-      - './mediamtx.yml:/mediamtx.yml'
