@@ -17,7 +17,7 @@
     "mermaid": "^11.10.1",
     "sharp": "^0.34.2",
     "starlight-typedoc": "^0.21.5",
-    "typedoc": "^0.28.16",
+    "typedoc": "^0.28.18",
     "typedoc-plugin-markdown": "^4.9.0"
   }
 }
