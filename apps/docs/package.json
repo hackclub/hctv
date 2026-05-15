@@ -14,7 +14,7 @@
     "@catppuccin/starlight": "^2.0.1",
     "astro": "^6.3.3",
     "astro-mermaid": "^2.0.1",
-    "mermaid": "^11.14.0",
+    "mermaid": "^11.15.0",
     "sharp": "^0.34.5",
     "starlight-typedoc": "^0.21.5",
     "typedoc": "^0.28.19",
