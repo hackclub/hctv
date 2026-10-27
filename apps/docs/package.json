@@ -12,7 +12,7 @@
   "dependencies": {
     "@astrojs/starlight": "^0.42.0",
     "@catppuccin/starlight": "^2.0.1",
-    "astro": "^7.3.2",
+    "astro": "^7.3.3",
     "astro-mermaid": "^2.0.1",
     "mermaid": "^11.16.1",
     "sharp": "^0.35.0",
